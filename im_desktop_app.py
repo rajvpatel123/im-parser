@@ -60,7 +60,7 @@ def _to_complex(val) -> complex:
     return complex(np.nan, np.nan)
 
 def parse_im_file(path: Path) -> List[CurveRecord]:
-    """Parse .im XML and return a list of CurveRecord objects (same logic as the tested script)."""
+    """Parse .im XML and return a list of CurveRecord objects (robust complex parsing)."""
     tree = ET.parse(str(path))
     root = tree.getroot()
     out: List[CurveRecord] = []
@@ -71,8 +71,8 @@ def parse_im_file(path: Path) -> List[CurveRecord]:
             cols: Dict[str, List[Any]] = {}
             meta: Dict[str, Dict[str, str]] = {}
             max_len = 0
-            # Use the same XPath as the working script to pick up data under meascondition
-            for data in curve.findall("./meascondition/..//data"):
+            # Walk all data nodes under the curve
+            for data in curve.findall(".//data"):
                 cid = data.get("id") or data.get("name") or f"col_{len(cols)}"
                 name = data.get("name") or cid
                 unit = data.get("unit") or ""
@@ -85,16 +85,14 @@ def parse_im_file(path: Path) -> List[CurveRecord]:
                     s = s.strip()
                     if not s:
                         vals.append(np.nan); continue
-                    # Detect "re im" pairs as in the working script
-                    if " " in s and not any(ch.isalpha() for ch in s):
-                        parts = s.split()
-                        if len(parts) == 2:
-                            try:
-                                vals.append((float(parts[0]), float(parts[1])))
-                                continue
-                            except Exception:
-                                vals.append(np.nan); continue
-                    # Fallback: scalar float
+                    # Try parse as two floats (supports scientific notation)
+                    m = re.match(r'^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*$', s)
+                    if m:
+                        try:
+                            vals.append((float(m.group(1)), float(m.group(2)))); continue
+                        except Exception:
+                            pass
+                    # else try single float
                     try:
                         vals.append(float(s))
                     except Exception:
@@ -102,7 +100,6 @@ def parse_im_file(path: Path) -> List[CurveRecord]:
                 cols[cid] = vals
                 meta[cid] = {"name": name, "unit": unit}
                 max_len = max(max_len, len(vals))
-            # pad columns to equal length
             for k, v in list(cols.items()):
                 if len(v) < max_len:
                     cols[k] = v + [np.nan] * (max_len - len(v))
@@ -455,7 +452,8 @@ class MainWindow(QtWidgets.QMainWindow):
             title = f"({rec.curve_name})"
             mode = "Pout=|B2|²" if self.controls.ignore_a2() else "Pout=|B2|²−|A2|²"
             self.plot_grid.plot_single(df, title_suffix=f"{title} • {mode}")
-            self.statusBar().showMessage(f"Computed with {mode}")
+            finite = int(np.isfinite(df["Pout [dBm] @ f0"].values).sum())
+            self.statusBar().showMessage(f"Computed with {mode} • finite Pout points: {finite}")
             self._last_df = df
             self._last_df2 = None
             self._last_labels = (self.labels[idx], None)
@@ -469,7 +467,9 @@ class MainWindow(QtWidgets.QMainWindow):
             title = f"({rec1.curve_name} vs {rec2.curve_name})"
             mode = "Pout=|B2|²" if self.controls.ignore_a2() else "Pout=|B2|²−|A2|²"
             self.plot_grid.plot_overlay(df1, self.labels[i1], df2, self.labels[i2], title_suffix=f"{title} • {mode}")
-            self.statusBar().showMessage(f"Computed with {mode}")
+            finite1 = int(np.isfinite(df1["Pout [dBm] @ f0"].values).sum())
+            finite2 = int(np.isfinite(df2["Pout [dBm] @ f0"].values).sum())
+            self.statusBar().showMessage(f"Computed with {mode} • finite Pout points: {finite1} / {finite2}")
             self._last_df = df1
             self._last_df2 = df2
             self._last_labels = (self.labels[i1], self.labels[i2])
