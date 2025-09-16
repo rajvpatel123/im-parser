@@ -60,7 +60,7 @@ def _to_complex(val) -> complex:
     return complex(np.nan, np.nan)
 
 def parse_im_file(path: Path) -> List[CurveRecord]:
-    """Parse .im XML and return a list of CurveRecord objects."""
+    """Parse .im XML and return a list of CurveRecord objects (same logic as the tested script)."""
     tree = ET.parse(str(path))
     root = tree.getroot()
     out: List[CurveRecord] = []
@@ -71,11 +71,12 @@ def parse_im_file(path: Path) -> List[CurveRecord]:
             cols: Dict[str, List[Any]] = {}
             meta: Dict[str, Dict[str, str]] = {}
             max_len = 0
-            for node in curve.findall(".//data"):
-                cid = node.get("id") or node.get("name") or f"col_{len(cols)}"
-                name = node.get("name") or cid
-                unit = node.get("unit") or ""
-                text = (node.text or "").strip()
+            # Use the same XPath as the working script to pick up data under meascondition
+            for data in curve.findall("./meascondition/..//data"):
+                cid = data.get("id") or data.get("name") or f"col_{len(cols)}"
+                name = data.get("name") or cid
+                unit = data.get("unit") or ""
+                text = (data.text or "").strip()
                 if text.startswith("[") and text.endswith("]"):
                     text = text[1:-1]
                 items = text.split(",") if text else []
@@ -84,6 +85,7 @@ def parse_im_file(path: Path) -> List[CurveRecord]:
                     s = s.strip()
                     if not s:
                         vals.append(np.nan); continue
+                    # Detect "re im" pairs as in the working script
                     if " " in s and not any(ch.isalpha() for ch in s):
                         parts = s.split()
                         if len(parts) == 2:
@@ -92,6 +94,7 @@ def parse_im_file(path: Path) -> List[CurveRecord]:
                                 continue
                             except Exception:
                                 vals.append(np.nan); continue
+                    # Fallback: scalar float
                     try:
                         vals.append(float(s))
                     except Exception:
@@ -99,6 +102,7 @@ def parse_im_file(path: Path) -> List[CurveRecord]:
                 cols[cid] = vals
                 meta[cid] = {"name": name, "unit": unit}
                 max_len = max(max_len, len(vals))
+            # pad columns to equal length
             for k, v in list(cols.items()):
                 if len(v) < max_len:
                     cols[k] = v + [np.nan] * (max_len - len(v))
@@ -192,6 +196,12 @@ def compute_metrics(record: CurveRecord, use_gamma_source: bool=False) -> pd.Dat
     })
     return df
 
+
+def cabs2(vec):
+    return np.abs(vec)**2
+
+def to_dbm(w):
+    return 10.0*np.log10(np.maximum(w, 1e-12)/1e-3)
 
 # ------------------------- UI components -------------------------
 
