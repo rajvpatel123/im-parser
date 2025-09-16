@@ -173,9 +173,12 @@ def compute_metrics(record: CurveRecord, use_gamma_source: bool=False) -> pd.Dat
     # Drain efficiency
     drain_eff = np.where(pdc > 0, (pout_w / pdc) * 100.0, np.nan)
 
-    # Input return loss: only valid if A1 & B1 present; else NaN
+    # Input return loss: compute Γ_in = B1/A1 safely (mask zeros/NaNs) or NaN if B1 missing
     if has_b1:
-        gamma_in = np.where(np.abs(a1) > 0, b1 / a1, complex(np.nan, np.nan))
+        gamma_in = np.full(rows, complex(np.nan, np.nan), dtype=complex)
+        denom_ok = (np.abs(a1) > 0) & np.isfinite(a1) & np.isfinite(b1)
+        # Safe elementwise division without raising warnings
+        np.divide(b1, a1, out=gamma_in, where=denom_ok)
         irl_db = -20.0 * np.log10(np.clip(np.abs(gamma_in), 1e-12, 1.0))
     else:
         irl_db = np.full(rows, np.nan)
