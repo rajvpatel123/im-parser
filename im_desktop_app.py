@@ -117,7 +117,7 @@ def _pick_col(meta: Dict[str, Dict[str, str]], prefix: str) -> Optional[str]:
             return cid
     return None
 
-def compute_metrics(record: CurveRecord, use_gamma_source: bool=False) -> pd.DataFrame:
+def compute_metrics(record: CurveRecord, use_gamma_source: bool=False, ignore_a2: bool=False) -> pd.DataFrame:
     """Compute Pout[dBm], Gt[dB], AM/PM offset[deg], Drain Eff[%], Input RL[dB] for a curve.
     Robust to missing A2/B1: if a wave is missing/NaN, fall back to simple definitions.
     """
@@ -153,11 +153,13 @@ def compute_metrics(record: CurveRecord, use_gamma_source: bool=False) -> pd.Dat
     has_a2 = np.isfinite(np.real(a2)).any()
     has_b1 = np.isfinite(np.real(b1)).any()
 
-    # Delivered output power: prefer net (|B2|^2 - |A2|^2), else simple (|B2|^2)
-    if has_a2:
-        pout_w = np.maximum(np.abs(b2)**2 - np.abs(a2)**2, 0.0)
+    # Delivered output power
+    if ignore_a2 or not has_a2:
+        # Disregard A2 entirely -> assume Pout = |B2|^2
+        pout_w = np.abs(b2)**2
     else:
-        pout_w = np.abs(b2)**2  # fallback if A2 missing
+        # Net delivered power
+        pout_w = np.maximum(np.abs(b2)**2 - np.abs(a2)**2, 0.0)
 
     # Available source power (approx): |A1|^2, optionally scaled by (1 - |ΓS|^2)
     pavs_w = np.abs(a1)**2 * (1.0 - np.minimum(np.abs(gamma_s)**2, 0.999999))
@@ -295,6 +297,7 @@ class ControlPanel(QtWidgets.QWidget):
         self.setMinimumWidth(320)
         self.overlay_cb = QtWidgets.QCheckBox("Overlay S1 & S3 (if present)")
         self.gamma_cb = QtWidgets.QCheckBox("Use Gamma Source (scale Pavs by 1−|Γs|²)")
+        self.ignore_a2_cb = QtWidgets.QCheckBox("Disregard A2 (assume Pout = |B2|²)")
         self.curve_combo = QtWidgets.QComboBox()
         self.trace1_combo = QtWidgets.QComboBox()
         self.trace2_combo = QtWidgets.QComboBox()
@@ -302,6 +305,7 @@ class ControlPanel(QtWidgets.QWidget):
         form = QtWidgets.QFormLayout()
         form.addRow(self.overlay_cb)
         form.addRow(self.gamma_cb)
+        form.addRow(self.ignore_a2_cb)
         form.addRow("Single curve:", self.curve_combo)
         form.addRow("Trace 1 (overlay):", self.trace1_combo)
         form.addRow("Trace 2 (overlay):", self.trace2_combo)
@@ -315,7 +319,7 @@ class ControlPanel(QtWidgets.QWidget):
         self.setLayout(form)
 
         # Signals -> trigger update
-        for w in (self.overlay_cb, self.gamma_cb, self.curve_combo, self.trace1_combo, self.trace2_combo):
+        for w in (self.overlay_cb, self.gamma_cb, self.ignore_a2_cb, self.curve_combo, self.trace1_combo, self.trace2_combo):
             if isinstance(w, QtWidgets.QComboBox):
                 w.currentIndexChanged.connect(lambda _=None, self=self: self.request_update.emit())
             elif isinstance(w, QtWidgets.QAbstractButton):
@@ -346,6 +350,9 @@ class ControlPanel(QtWidgets.QWidget):
 
     def use_gamma(self) -> bool:
         return self.gamma_cb.isChecked()
+
+    def ignore_a2(self) -> bool:
+        return self.ignore_a2_cb.isChecked()
 
     def current_curve_index(self) -> int:
         return self.curve_combo.currentIndex()
@@ -444,9 +451,11 @@ class MainWindow(QtWidgets.QMainWindow):
             idx = self.controls.current_curve_index()
             idx = max(0, min(idx, len(self.curves)-1))
             rec = self.curves[idx]
-            df = compute_metrics(rec, use_gamma_source=use_gamma)
+            df = compute_metrics(rec, use_gamma_source=use_gamma, ignore_a2=self.controls.ignore_a2())
             title = f"({rec.curve_name})"
-            self.plot_grid.plot_single(df, title_suffix=title)
+            mode = "Pout=|B2|²" if self.controls.ignore_a2() else "Pout=|B2|²−|A2|²"
+            self.plot_grid.plot_single(df, title_suffix=f"{title} • {mode}")
+            self.statusBar().showMessage(f"Computed with {mode}")
             self._last_df = df
             self._last_df2 = None
             self._last_labels = (self.labels[idx], None)
@@ -455,10 +464,12 @@ class MainWindow(QtWidgets.QMainWindow):
             i1 = max(0, min(i1, len(self.curves)-1))
             i2 = max(0, min(i2, len(self.curves)-1))
             rec1, rec2 = self.curves[i1], self.curves[i2]
-            df1 = compute_metrics(rec1, use_gamma_source=use_gamma)
-            df2 = compute_metrics(rec2, use_gamma_source=use_gamma)
+            df1 = compute_metrics(rec1, use_gamma_source=use_gamma, ignore_a2=self.controls.ignore_a2())
+            df2 = compute_metrics(rec2, use_gamma_source=use_gamma, ignore_a2=self.controls.ignore_a2())
             title = f"({rec1.curve_name} vs {rec2.curve_name})"
-            self.plot_grid.plot_overlay(df1, self.labels[i1], df2, self.labels[i2], title_suffix=title)
+            mode = "Pout=|B2|²" if self.controls.ignore_a2() else "Pout=|B2|²−|A2|²"
+            self.plot_grid.plot_overlay(df1, self.labels[i1], df2, self.labels[i2], title_suffix=f"{title} • {mode}")
+            self.statusBar().showMessage(f"Computed with {mode}")
             self._last_df = df1
             self._last_df2 = df2
             self._last_labels = (self.labels[i1], self.labels[i2])
