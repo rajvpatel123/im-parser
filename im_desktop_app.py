@@ -307,9 +307,9 @@ class ControlPanel(QtWidgets.QWidget):
         # Signals -> trigger update
         for w in (self.overlay_cb, self.gamma_cb, self.curve_combo, self.trace1_combo, self.trace2_combo):
             if isinstance(w, QtWidgets.QComboBox):
-                w.currentIndexChanged.connect(self.request_update.emit)
+                w.currentIndexChanged.connect(lambda _=None, self=self: self.request_update.emit())
             elif isinstance(w, QtWidgets.QAbstractButton):
-                w.toggled.connect(self.request_update.emit)
+                w.toggled.connect(lambda _=None, self=self: self.request_update.emit())
 
     def set_labels(self, labels: List[str]):
         self.curve_combo.blockSignals(True)
