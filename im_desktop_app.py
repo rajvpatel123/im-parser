@@ -48,13 +48,18 @@ class CurveRecord:
     rows: int
 
 def _to_complex(val) -> complex:
+    # Accept tuple/list/np.ndarray of length 2, or single float
+    import numpy as _np
     if isinstance(val, complex):
         return val
-    if isinstance(val, tuple) and len(val) == 2:
+    if isinstance(val, (tuple, list, _np.ndarray)) and len(val) == 2:
         try:
             return complex(float(val[0]), float(val[1]))
         except Exception:
-            return complex(np.nan, np.nan)
+            return complex(_np.nan, _np.nan)
+    if isinstance(val, (int, float)) and _np.isfinite(val):
+        return complex(val, 0.0)
+    return complex(_np.nan, _np.nan)
     if isinstance(val, (int, float)) and np.isfinite(val):
         return complex(val, 0.0)
     return complex(np.nan, np.nan)
