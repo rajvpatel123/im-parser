@@ -23,7 +23,7 @@ pyinstaller --noconfirm --clean --onefile --windowed ^
   im_desktop_app.py
 """
 
-import sys, math, xml.etree.ElementTree as ET
+import sys, math, re, xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
