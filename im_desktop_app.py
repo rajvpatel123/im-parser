@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 """
 IM Desktop Viewer (Offline, No Browser)
----------------------------------------
 PySide6 desktop application to parse .im (XML) RF files and display 4 charts:
   • Gt(dB) @ f0 vs Pout(dBm) @ f0
   • AM/PM(offset) @ f0 vs Pout(dBm) @ f0
@@ -14,13 +13,17 @@ Features
 - Single-curve mode OR S1/S3 overlay mode (auto-detect + manual selection)
 - Optional Γ_source scaling for Pavs (if "Gamma Source" exists in the file)
 - Export: Save CSV (metrics) and Save All Plots (PNGs)
+- View > Diagnostics…  (lists which columns were detected per curve)
 
-Build
-- Windows:   pyinstaller --noconfirm --clean --onefile --name IMDesktop im_desktop_app.py
-- macOS/Linux (windowed): pyinstaller --noconfirm --clean --windowed --onefile --name IMDesktop im_desktop_app.py
+Build (Windows one-file EXE):
+pyinstaller --noconfirm --clean --onefile --windowed ^
+  --name "IMDesktop" ^
+  --collect-all PySide6 ^
+  --collect-all matplotlib ^
+  im_desktop_app.py
 """
 
-import sys, os, math, xml.etree.ElementTree as ET
+import sys, math, xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -111,7 +114,9 @@ def _pick_col(meta: Dict[str, Dict[str, str]], prefix: str) -> Optional[str]:
     return None
 
 def compute_metrics(record: CurveRecord, use_gamma_source: bool=False) -> pd.DataFrame:
-    """Compute Pout[dBm], Gt[dB], AM/PM offset[deg], Drain Eff[%], Input RL[dB] for a curve."""
+    """Compute Pout[dBm], Gt[dB], AM/PM offset[deg], Drain Eff[%], Input RL[dB] for a curve.
+    Robust to missing A2/B1: if a wave is missing/NaN, fall back to simple definitions.
+    """
     cols, meta, rows = record.cols, record.meta, record.rows
 
     def arr_complex(cid):
@@ -140,16 +145,26 @@ def compute_metrics(record: CurveRecord, use_gamma_source: bool=False) -> pd.Dat
     pdc = arr_float(Pdc)
     gamma_s = arr_complex(Gs) if use_gamma_source else np.full(rows, complex(0.0, 0.0))
 
-    # Delivered output power to load (net): |B2|^2 - |A2|^2
-    pout_w = np.maximum(np.abs(b2)**2 - np.abs(a2)**2, 0.0)
+    # Detect missing/empty waves
+    has_a2 = np.isfinite(np.real(a2)).any()
+    has_b1 = np.isfinite(np.real(b1)).any()
+
+    # Delivered output power: prefer net (|B2|^2 - |A2|^2), else simple (|B2|^2)
+    if has_a2:
+        pout_w = np.maximum(np.abs(b2)**2 - np.abs(a2)**2, 0.0)
+    else:
+        pout_w = np.abs(b2)**2  # fallback if A2 missing
+
     # Available source power (approx): |A1|^2, optionally scaled by (1 - |ΓS|^2)
     pavs_w = np.abs(a1)**2 * (1.0 - np.minimum(np.abs(gamma_s)**2, 0.999999))
+
+    # Convert to dBm
     pout_dbm = 10.0 * np.log10(np.maximum(pout_w, 1e-12) / 1e-3)
 
-    # Transducer gain
+    # Transducer gain (Gt)
     gt_db = 10.0 * np.log10(np.maximum(pout_w / np.where(pavs_w > 1e-18, pavs_w, np.nan), 1e-18))
 
-    # AM/PM offset (relative phase, unwrapped, referenced to first finite point)
+    # AM/PM offset (relative phase, unwrapped)
     phase_rel = np.unwrap(np.angle(b2) - np.angle(a1))
     finite = np.isfinite(phase_rel) & np.isfinite(pout_dbm)
     ref = phase_rel[finite][0] if np.any(finite) else 0.0
@@ -158,9 +173,12 @@ def compute_metrics(record: CurveRecord, use_gamma_source: bool=False) -> pd.Dat
     # Drain efficiency
     drain_eff = np.where(pdc > 0, (pout_w / pdc) * 100.0, np.nan)
 
-    # Input return loss
-    gamma_in = np.where(np.abs(a1) > 0, b1 / a1, complex(np.nan, np.nan))
-    irl_db = -20.0 * np.log10(np.clip(np.abs(gamma_in), 1e-12, 1.0))
+    # Input return loss: only valid if A1 & B1 present; else NaN
+    if has_b1:
+        gamma_in = np.where(np.abs(a1) > 0, b1 / a1, complex(np.nan, np.nan))
+        irl_db = -20.0 * np.log10(np.clip(np.abs(gamma_in), 1e-12, 1.0))
+    else:
+        irl_db = np.full(rows, np.nan)
 
     df = pd.DataFrame({
         "Pout [dBm] @ f0": pout_dbm,
@@ -195,19 +213,23 @@ class PlotGrid(QtWidgets.QWidget):
         self.clear()
         x = df["Pout [dBm] @ f0"].values
 
-        self.ax_gt.plot(x, df["Gt [dB] @ f0"].values, marker="o")
+        m = np.isfinite(x) & np.isfinite(df["Gt [dB] @ f0"].values)
+        self.ax_gt.plot(x[m], df["Gt [dB] @ f0"].values[m], marker="o")
         self.ax_gt.set_xlabel("Pout [dBm] @ f0"); self.ax_gt.set_ylabel("Gt [dB] @ f0")
         self.ax_gt.set_title(f"Gt vs Pout {title_suffix}".strip())
 
-        self.ax_ampm.plot(x, df["AM/PM offset [deg] @ f0"].values, marker="o")
+        m2 = np.isfinite(x) & np.isfinite(df["AM/PM offset [deg] @ f0"].values)
+        self.ax_ampm.plot(x[m2], df["AM/PM offset [deg] @ f0"].values[m2], marker="o")
         self.ax_ampm.set_xlabel("Pout [dBm] @ f0"); self.ax_ampm.set_ylabel("AM/PM offset [deg] @ f0")
         self.ax_ampm.set_title(f"AM/PM vs Pout {title_suffix}".strip())
 
-        self.ax_eff.plot(x, df["Drain Efficiency [%] @ f0"].values, marker="o")
+        m3 = np.isfinite(x) & np.isfinite(df["Drain Efficiency [%] @ f0"].values)
+        self.ax_eff.plot(x[m3], df["Drain Efficiency [%] @ f0"].values[m3], marker="o")
         self.ax_eff.set_xlabel("Pout [dBm] @ f0"); self.ax_eff.set_ylabel("Drain Efficiency [%] @ f0")
         self.ax_eff.set_title(f"Drain Efficiency vs Pout {title_suffix}".strip())
 
-        self.ax_irl.plot(x, df["Input Return Loss [dB] @ f0"].values, marker="o")
+        m4 = np.isfinite(x) & np.isfinite(df["Input Return Loss [dB] @ f0"].values)
+        self.ax_irl.plot(x[m4], df["Input Return Loss [dB] @ f0"].values[m4], marker="o")
         self.ax_irl.set_xlabel("Pout [dBm] @ f0"); self.ax_irl.set_ylabel("Input Return Loss [dB] @ f0")
         self.ax_irl.set_title(f"Input RL vs Pout {title_suffix}".strip())
 
@@ -217,23 +239,31 @@ class PlotGrid(QtWidgets.QWidget):
         self.clear()
         x1 = df1["Pout [dBm] @ f0"].values; x2 = df2["Pout [dBm] @ f0"].values
 
-        self.ax_gt.plot(x1, df1["Gt [dB] @ f0"].values, marker="o", label=lbl1)
-        self.ax_gt.plot(x2, df2["Gt [dB] @ f0"].values, marker="s", label=lbl2)
+        m1 = np.isfinite(x1) & np.isfinite(df1["Gt [dB] @ f0"].values)
+        m2 = np.isfinite(x2) & np.isfinite(df2["Gt [dB] @ f0"].values)
+        self.ax_gt.plot(x1[m1], df1["Gt [dB] @ f0"].values[m1], marker="o", label=lbl1)
+        self.ax_gt.plot(x2[m2], df2["Gt [dB] @ f0"].values[m2], marker="s", label=lbl2)
         self.ax_gt.set_xlabel("Pout [dBm] @ f0"); self.ax_gt.set_ylabel("Gt [dB] @ f0")
         self.ax_gt.set_title(f"Gt vs Pout {title_suffix}".strip()); self.ax_gt.legend()
 
-        self.ax_ampm.plot(x1, df1["AM/PM offset [deg] @ f0"].values, marker="o", label=lbl1)
-        self.ax_ampm.plot(x2, df2["AM/PM offset [deg] @ f0"].values, marker="s", label=lbl2)
+        ma1 = np.isfinite(x1) & np.isfinite(df1["AM/PM offset [deg] @ f0"].values)
+        ma2 = np.isfinite(x2) & np.isfinite(df2["AM/PM offset [deg] @ f0"].values)
+        self.ax_ampm.plot(x1[ma1], df1["AM/PM offset [deg] @ f0"].values[ma1], marker="o", label=lbl1)
+        self.ax_ampm.plot(x2[ma2], df2["AM/PM offset [deg] @ f0"].values[ma2], marker="s", label=lbl2)
         self.ax_ampm.set_xlabel("Pout [dBm] @ f0"); self.ax_ampm.set_ylabel("AM/PM offset [deg] @ f0")
         self.ax_ampm.set_title(f"AM/PM vs Pout {title_suffix}".strip()); self.ax_ampm.legend()
 
-        self.ax_eff.plot(x1, df1["Drain Efficiency [%] @ f0"].values, marker="o", label=lbl1)
-        self.ax_eff.plot(x2, df2["Drain Efficiency [%] @ f0"].values, marker="s", label=lbl2)
+        me1 = np.isfinite(x1) & np.isfinite(df1["Drain Efficiency [%] @ f0"].values)
+        me2 = np.isfinite(x2) & np.isfinite(df2["Drain Efficiency [%] @ f0"].values)
+        self.ax_eff.plot(x1[me1], df1["Drain Efficiency [%] @ f0"].values[me1], marker="o", label=lbl1)
+        self.ax_eff.plot(x2[me2], df2["Drain Efficiency [%] @ f0"].values[me2], marker="s", label=lbl2)
         self.ax_eff.set_xlabel("Pout [dBm] @ f0"); self.ax_eff.set_ylabel("Drain Efficiency [%] @ f0")
         self.ax_eff.set_title(f"Drain Efficiency vs Pout {title_suffix}".strip()); self.ax_eff.legend()
 
-        self.ax_irl.plot(x1, df1["Input Return Loss [dB] @ f0"].values, marker="o", label=lbl1)
-        self.ax_irl.plot(x2, df2["Input Return Loss [dB] @ f0"].values, marker="s", label=lbl2)
+        mi1 = np.isfinite(x1) & np.isfinite(df1["Input Return Loss [dB] @ f0"].values)
+        mi2 = np.isfinite(x2) & np.isfinite(df2["Input Return Loss [dB] @ f0"].values)
+        self.ax_irl.plot(x1[mi1], df1["Input Return Loss [dB] @ f0"].values[mi1], marker="o", label=lbl1)
+        self.ax_irl.plot(x2[mi2], df2["Input Return Loss [dB] @ f0"].values[mi2], marker="s", label=lbl2)
         self.ax_irl.set_xlabel("Pout [dBm] @ f0"); self.ax_irl.set_ylabel("Input Return Loss [dB] @ f0")
         self.ax_irl.set_title(f"Input RL vs Pout {title_suffix}".strip()); self.ax_irl.legend()
 
@@ -343,6 +373,11 @@ class MainWindow(QtWidgets.QMainWindow):
         exit_act.triggered.connect(self.close)
         file_menu.addAction(exit_act)
 
+        view_menu = self.menuBar().addMenu("&View")
+        diag_act = QtGui.QAction("Diagnostics…", self)
+        diag_act.triggered.connect(self.show_diagnostics)
+        view_menu.addAction(diag_act)
+
         # Export actions connect to control buttons
         self.controls.export_csv_btn.clicked.connect(self.export_csv)
         self.controls.export_plots_btn.clicked.connect(self.export_plots)
@@ -358,7 +393,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             self.curves = parse_im_file(Path(path))
         except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Parse Error", f"Failed to parse XML:\n{e}")
+            QtWidgets.QMessageBox.critical(self, "Parse Error", f"Failed to parse XML:\\n{e}")
             return
 
         self.labels = [f"{c.dataset_name} / {c.curve_name}" for c in self.curves]
@@ -368,6 +403,22 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Initial plot
         self.update_plots()
+
+    # ----- Diagnostics -----
+    def show_diagnostics(self):
+        if not self.curves:
+            QtWidgets.QMessageBox.information(self, "Diagnostics", "No file loaded.")
+            return
+        msgs = []
+        for i, rec in enumerate(self.curves):
+            cols = set(rec.cols.keys())
+            names = {cid: (rec.meta.get(cid, {}).get('name') or cid) for cid in cols}
+            keys = []
+            for k in ["A1","A2","B1","B2","Pdc","Gamma Source"]:
+                if any((names[c].lower().startswith(k.lower())) for c in cols):
+                    keys.append(k)
+            msgs.append(f"[{i}] {rec.dataset_name} / {rec.curve_name}\\n  Found: " + (', '.join(keys) if keys else 'none'))
+        QtWidgets.QMessageBox.information(self, "Diagnostics", "\\n\\n".join(msgs))
 
     # ----- Plotting -----
     def update_plots(self):
@@ -418,7 +469,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 df_combined.to_csv(path, index=False)
             self.statusBar().showMessage(f"Saved CSV: {path}", 5000)
         except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Save Error", f"Failed to save CSV:\n{e}")
+            QtWidgets.QMessageBox.critical(self, "Save Error", f"Failed to save CSV:\\n{e}")
 
     def export_plots(self):
         if not hasattr(self, "plot_grid"):
@@ -427,12 +478,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if not dir_path:
             return
         try:
-            # Save a single 2x2 image; advanced: could save individual axes as well
             prefix = "S1S3" if self.controls.is_overlay() else "Single"
             self.plot_grid.save_all(Path(dir_path), prefix=prefix)
             self.statusBar().showMessage(f"Saved plots to: {dir_path}", 5000)
         except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Save Error", f"Failed to save plots:\n{e}")
+            QtWidgets.QMessageBox.critical(self, "Save Error", f"Failed to save plots:\\n{e}")
 
 
 def main():
