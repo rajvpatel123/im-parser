@@ -125,6 +125,8 @@ def compute_metrics(record: CurveRecord, use_gamma_source: bool=False, ignore_a2
     """
     cols, meta, rows = record.cols, record.meta, record.rows
 
+#fix imaginary issue
+
     def arr_complex(cid):
         if cid is None: return np.full(rows, complex(np.nan, np.nan))
         raw = np.asarray(cols[cid], dtype=object)
@@ -158,10 +160,14 @@ def compute_metrics(record: CurveRecord, use_gamma_source: bool=False, ignore_a2
     # Delivered output power
     if ignore_a2 or not has_a2:
         # Disregard A2 entirely -> assume Pout = |B2|^2
-        pout_w = np.abs(b2)**2
+        b2 = b2/2
+        pout_w = np.abs(b2*b2)
     else:
         # Net delivered power
-        pout_w = np.maximum(np.abs(b2)**2 - np.abs(a2)**2, 0.0)
+        b2=b2/2
+        a2 = a2/2
+        
+        pout_w = np.maximum(np.abs(b2*b2) - np.abs(a2*a2), 0.0)
 
     # Available source power (approx): |A1|^2, optionally scaled by (1 - |ΓS|^2)
     pavs_w = np.abs(a1)**2 * (1.0 - np.minimum(np.abs(gamma_s)**2, 0.999999))
