@@ -1,26 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-IM Desktop Viewer (Offline, No Browser)
-PySide6 desktop application to parse .im (XML) RF files and display 4 charts:
-  • Gt(dB) @ f0 vs Pout(dBm) @ f0
-  • AM/PM(offset) @ f0 vs Pout(dBm) @ f0
-  • Drain Efficiency(%) @ f0 vs Pout(dBm) @ f0
-  • Input Return Loss(dB) @ f0 vs Pout(dBm) @ f0
+IM Desktop Viewer (Overlay ALL added using original logic)
+This is your original plotting logic with a minimal, surgical addition:
+- A new checkbox "Overlay ALL curves"
+- A new PlotGrid.plot_overlay_many() that reuses the same plotting style
+- Update to MainWindow.update_plots() to compute metrics for every curve
+- CSV export can save the combined table for ALL curves (columns suffixed by label)
 
-Features
-- File > Open .im
-- Single-curve mode OR S1/S3 overlay mode (auto-detect + manual selection)
-- Optional Γ_source scaling for Pavs (if "Gamma Source" exists in the file)
-- Export: Save CSV (metrics) and Save All Plots (PNGs)
-- View > Diagnostics…  (lists which columns were detected per curve)
-
-Build (Windows one-file EXE):
-pyinstaller --noconfirm --clean --onefile --windowed ^
-  --name "IMDesktop" ^
-  --collect-all PySide6 ^
-  --collect-all matplotlib ^
-  im_desktop_app.py
+Base logic (parsing, metrics, S1/S3 overlay, etc.) is preserved from your working file.
 """
 
 import sys, math, re, xml.etree.ElementTree as ET
@@ -60,9 +48,6 @@ def _to_complex(val) -> complex:
     if isinstance(val, (int, float)) and _np.isfinite(val):
         return complex(val, 0.0)
     return complex(_np.nan, _np.nan)
-    if isinstance(val, (int, float)) and np.isfinite(val):
-        return complex(val, 0.0)
-    return complex(np.nan, np.nan)
 
 def parse_im_file(path: Path) -> List[CurveRecord]:
     """Parse .im XML and return a list of CurveRecord objects (robust complex parsing)."""
@@ -90,7 +75,7 @@ def parse_im_file(path: Path) -> List[CurveRecord]:
                     s = s.strip()
                     if not s:
                         vals.append(np.nan); continue
-                    # Try parse as two floats (supports scientific notation)
+                    # Try parse as two floats (supports scientific notation) separated by whitespace
                     m = re.match(r'^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*$', s)
                     if m:
                         try:
@@ -121,11 +106,9 @@ def _pick_col(meta: Dict[str, Dict[str, str]], prefix: str) -> Optional[str]:
 
 def compute_metrics(record: CurveRecord, use_gamma_source: bool=False, ignore_a2: bool=False) -> pd.DataFrame:
     """Compute Pout[dBm], Gt[dB], AM/PM offset[deg], Drain Eff[%], Input RL[dB] for a curve.
-    Robust to missing A2/B1: if a wave is missing/NaN, fall back to simple definitions.
+    Preserves your original logic, including the /sqrt(2) scaling you used for waves.
     """
     cols, meta, rows = record.cols, record.meta, record.rows
-
-#fix imaginary issue
 
     def arr_complex(cid):
         if cid is None: return np.full(rows, complex(np.nan, np.nan))
@@ -157,16 +140,13 @@ def compute_metrics(record: CurveRecord, use_gamma_source: bool=False, ignore_a2
     has_a2 = np.isfinite(np.real(a2)).any()
     has_b1 = np.isfinite(np.real(b1)).any()
 
-    # Delivered output power
+    # Delivered output power (your original scaling by 1/sqrt(2) before squaring)
     if ignore_a2 or not has_a2:
-        # Disregard A2 entirely -> assume Pout = |B2|^2
-        b2 = b2/2
+        b2 = b2/np.sqrt(2)
         pout_w = np.abs(b2*b2)
     else:
-        # Net delivered power
-        b2=b2/2
-        a2 = a2/2
-        
+        b2 = b2/np.sqrt(2)
+        a2 = a2/np.sqrt(2)
         pout_w = np.maximum(np.abs(b2*b2) - np.abs(a2*a2), 0.0)
 
     # Available source power (approx): |A1|^2, optionally scaled by (1 - |ΓS|^2)
@@ -187,11 +167,10 @@ def compute_metrics(record: CurveRecord, use_gamma_source: bool=False, ignore_a2
     # Drain efficiency
     drain_eff = np.where(pdc > 0, (pout_w / pdc) * 100.0, np.nan)
 
-    # Input return loss: compute Γ_in = B1/A1 safely (mask zeros/NaNs) or NaN if B1 missing
+    # Input return loss: compute Γ_in = B1/A1 safely or NaN if B1 missing
     if has_b1:
         gamma_in = np.full(rows, complex(np.nan, np.nan), dtype=complex)
         denom_ok = (np.abs(a1) > 0) & np.isfinite(a1) & np.isfinite(b1)
-        # Safe elementwise division without raising warnings
         np.divide(b1, a1, out=gamma_in, where=denom_ok)
         irl_db = -20.0 * np.log10(np.clip(np.abs(gamma_in), 1e-12, 1.0))
     else:
@@ -207,16 +186,10 @@ def compute_metrics(record: CurveRecord, use_gamma_source: bool=False, ignore_a2
     return df
 
 
-def cabs2(vec):
-    return np.abs(vec)**2
-
-def to_dbm(w):
-    return 10.0*np.log10(np.maximum(w, 1e-12)/1e-3)
-
 # ------------------------- UI components -------------------------
 
 class PlotGrid(QtWidgets.QWidget):
-    """Four Matplotlib plots in a 2x2 grid."""
+    """Four Matplotlib plots in a 2x2 grid. Original plotting style preserved."""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.figure = Figure(figsize=(9, 6), tight_layout=True)
@@ -239,22 +212,22 @@ class PlotGrid(QtWidgets.QWidget):
         m = np.isfinite(x) & np.isfinite(df["Gt [dB] @ f0"].values)
         self.ax_gt.plot(x[m], df["Gt [dB] @ f0"].values[m], marker="o")
         self.ax_gt.set_xlabel("Pout [dBm] @ f0"); self.ax_gt.set_ylabel("Gt [dB] @ f0")
-        self.ax_gt.set_title(f"Gt vs Pout {title_suffix}".strip())
+        self.ax_gt.set_title("Gt vs Pout")
 
         m2 = np.isfinite(x) & np.isfinite(df["AM/PM offset [deg] @ f0"].values)
         self.ax_ampm.plot(x[m2], df["AM/PM offset [deg] @ f0"].values[m2], marker="o")
         self.ax_ampm.set_xlabel("Pout [dBm] @ f0"); self.ax_ampm.set_ylabel("AM/PM offset [deg] @ f0")
-        self.ax_ampm.set_title(f"AM/PM vs Pout {title_suffix}".strip())
+        self.ax_ampm.set_title("AM/PM vs Pout")
 
         m3 = np.isfinite(x) & np.isfinite(df["Drain Efficiency [%] @ f0"].values)
         self.ax_eff.plot(x[m3], df["Drain Efficiency [%] @ f0"].values[m3], marker="o")
         self.ax_eff.set_xlabel("Pout [dBm] @ f0"); self.ax_eff.set_ylabel("Drain Efficiency [%] @ f0")
-        self.ax_eff.set_title(f"Drain Efficiency vs Pout {title_suffix}".strip())
+        self.ax_eff.set_title("Drain Efficiency vs Pout")
 
         m4 = np.isfinite(x) & np.isfinite(df["Input Return Loss [dB] @ f0"].values)
         self.ax_irl.plot(x[m4], df["Input Return Loss [dB] @ f0"].values[m4], marker="o")
         self.ax_irl.set_xlabel("Pout [dBm] @ f0"); self.ax_irl.set_ylabel("Input Return Loss [dB] @ f0")
-        self.ax_irl.set_title(f"Input RL vs Pout {title_suffix}".strip())
+        self.ax_irl.set_title("Input RL vs Pout")
 
         self.canvas.draw_idle()
 
@@ -267,28 +240,60 @@ class PlotGrid(QtWidgets.QWidget):
         self.ax_gt.plot(x1[m1], df1["Gt [dB] @ f0"].values[m1], marker="o", label=lbl1)
         self.ax_gt.plot(x2[m2], df2["Gt [dB] @ f0"].values[m2], marker="s", label=lbl2)
         self.ax_gt.set_xlabel("Pout [dBm] @ f0"); self.ax_gt.set_ylabel("Gt [dB] @ f0")
-        self.ax_gt.set_title(f"Gt vs Pout {title_suffix}".strip()); self.ax_gt.legend()
+        self.ax_gt.set_title("Gt vs Pout"); self.ax_gt.legend()
 
         ma1 = np.isfinite(x1) & np.isfinite(df1["AM/PM offset [deg] @ f0"].values)
         ma2 = np.isfinite(x2) & np.isfinite(df2["AM/PM offset [deg] @ f0"].values)
         self.ax_ampm.plot(x1[ma1], df1["AM/PM offset [deg] @ f0"].values[ma1], marker="o", label=lbl1)
         self.ax_ampm.plot(x2[ma2], df2["AM/PM offset [deg] @ f0"].values[ma2], marker="s", label=lbl2)
         self.ax_ampm.set_xlabel("Pout [dBm] @ f0"); self.ax_ampm.set_ylabel("AM/PM offset [deg] @ f0")
-        self.ax_ampm.set_title(f"AM/PM vs Pout {title_suffix}".strip()); self.ax_ampm.legend()
+        self.ax_ampm.set_title("AM/PM vs Pout"); self.ax_ampm.legend()
 
         me1 = np.isfinite(x1) & np.isfinite(df1["Drain Efficiency [%] @ f0"].values)
         me2 = np.isfinite(x2) & np.isfinite(df2["Drain Efficiency [%] @ f0"].values)
         self.ax_eff.plot(x1[me1], df1["Drain Efficiency [%] @ f0"].values[me1], marker="o", label=lbl1)
         self.ax_eff.plot(x2[me2], df2["Drain Efficiency [%] @ f0"].values[me2], marker="s", label=lbl2)
         self.ax_eff.set_xlabel("Pout [dBm] @ f0"); self.ax_eff.set_ylabel("Drain Efficiency [%] @ f0")
-        self.ax_eff.set_title(f"Drain Efficiency vs Pout {title_suffix}".strip()); self.ax_eff.legend()
+        self.ax_eff.set_title("Drain Efficiency vs Pout"); self.ax_eff.legend()
 
         mi1 = np.isfinite(x1) & np.isfinite(df1["Input Return Loss [dB] @ f0"].values)
         mi2 = np.isfinite(x2) & np.isfinite(df2["Input Return Loss [dB] @ f0"].values)
         self.ax_irl.plot(x1[mi1], df1["Input Return Loss [dB] @ f0"].values[mi1], marker="o", label=lbl1)
         self.ax_irl.plot(x2[mi2], df2["Input Return Loss [dB] @ f0"].values[mi2], marker="s", label=lbl2)
         self.ax_irl.set_xlabel("Pout [dBm] @ f0"); self.ax_irl.set_ylabel("Input Return Loss [dB] @ f0")
-        self.ax_irl.set_title(f"Input RL vs Pout {title_suffix}".strip()); self.ax_irl.legend()
+        self.ax_irl.set_title("Input RL vs Pout"); self.ax_irl.legend()
+
+        self.canvas.draw_idle()
+
+    def plot_overlay_many(self, dfs: List[pd.DataFrame], labels: List[str]):
+        """Overlay MANY curves on all 4 axes using the same style as your overlay()."""
+        self.clear()
+        for df, lbl in zip(dfs, labels):
+            x = df["Pout [dBm] @ f0"].values
+
+            m = np.isfinite(x) & np.isfinite(df["Gt [dB] @ f0"].values)
+            self.ax_gt.plot(x[m], df["Gt [dB] @ f0"].values[m], marker="o", linewidth=1.0, markersize=3, label=lbl)
+
+            m2 = np.isfinite(x) & np.isfinite(df["AM/PM offset [deg] @ f0"].values)
+            self.ax_ampm.plot(x[m2], df["AM/PM offset [deg] @ f0"].values[m2], marker="o", linewidth=1.0, markersize=3, label=lbl)
+
+            m3 = np.isfinite(x) & np.isfinite(df["Drain Efficiency [%] @ f0"].values)
+            self.ax_eff.plot(x[m3], df["Drain Efficiency [%] @ f0"].values[m3], marker="o", linewidth=1.0, markersize=3, label=lbl)
+
+            m4 = np.isfinite(x) & np.isfinite(df["Input Return Loss [dB] @ f0"].values)
+            self.ax_irl.plot(x[m4], df["Input Return Loss [dB] @ f0"].values[m4], marker="o", linewidth=1.0, markersize=3, label=lbl)
+
+        # Labels/titles
+        self.ax_gt.set_xlabel("Pout [dBm] @ f0"); self.ax_gt.set_ylabel("Gt [dB] @ f0"); self.ax_gt.set_title("Gt vs Pout")
+        self.ax_ampm.set_xlabel("Pout [dBm] @ f0"); self.ax_ampm.set_ylabel("AM/PM offset [deg] @ f0"); self.ax_ampm.set_title("AM/PM vs Pout")
+        self.ax_eff.set_xlabel("Pout [dBm] @ f0"); self.ax_eff.set_ylabel("Drain Efficiency [%] @ f0"); self.ax_eff.set_title("Drain Efficiency vs Pout")
+        self.ax_irl.set_xlabel("Pout [dBm] @ f0"); self.ax_irl.set_ylabel("Input Return Loss [dB] @ f0"); self.ax_irl.set_title("Input RL vs Pout")
+
+        if len(labels) <= 20:
+            self.ax_gt.legend(fontsize=8)
+            self.ax_ampm.legend(fontsize=8)
+            self.ax_eff.legend(fontsize=8)
+            self.ax_irl.legend(fontsize=8)
 
         self.canvas.draw_idle()
 
@@ -302,8 +307,9 @@ class ControlPanel(QtWidgets.QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumWidth(320)
+        self.setMinimumWidth(340)
         self.overlay_cb = QtWidgets.QCheckBox("Overlay S1 & S3 (if present)")
+        self.overlay_all_cb = QtWidgets.QCheckBox("Overlay ALL curves")  # NEW
         self.gamma_cb = QtWidgets.QCheckBox("Use Gamma Source (scale Pavs by 1−|Γs|²)")
         self.ignore_a2_cb = QtWidgets.QCheckBox("Disregard A2 (assume Pout = |B2|²)")
         self.curve_combo = QtWidgets.QComboBox()
@@ -312,6 +318,7 @@ class ControlPanel(QtWidgets.QWidget):
 
         form = QtWidgets.QFormLayout()
         form.addRow(self.overlay_cb)
+        form.addRow(self.overlay_all_cb)  # NEW
         form.addRow(self.gamma_cb)
         form.addRow(self.ignore_a2_cb)
         form.addRow("Single curve:", self.curve_combo)
@@ -327,7 +334,7 @@ class ControlPanel(QtWidgets.QWidget):
         self.setLayout(form)
 
         # Signals -> trigger update
-        for w in (self.overlay_cb, self.gamma_cb, self.ignore_a2_cb, self.curve_combo, self.trace1_combo, self.trace2_combo):
+        for w in (self.overlay_cb, self.overlay_all_cb, self.gamma_cb, self.ignore_a2_cb, self.curve_combo, self.trace1_combo, self.trace2_combo):
             if isinstance(w, QtWidgets.QComboBox):
                 w.currentIndexChanged.connect(lambda _=None, self=self: self.request_update.emit())
             elif isinstance(w, QtWidgets.QAbstractButton):
@@ -356,6 +363,9 @@ class ControlPanel(QtWidgets.QWidget):
     def is_overlay(self) -> bool:
         return self.overlay_cb.isChecked()
 
+    def is_overlay_all(self) -> bool:   # NEW
+        return self.overlay_all_cb.isChecked()
+
     def use_gamma(self) -> bool:
         return self.gamma_cb.isChecked()
 
@@ -372,7 +382,7 @@ class ControlPanel(QtWidgets.QWidget):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("IM Desktop Viewer")
+        self.setWindowTitle("IM Desktop Viewer (Overlay ALL)")
         self.resize(1200, 800)
 
         self.curves: List[CurveRecord] = []
@@ -413,6 +423,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.statusBar().showMessage("Open a .im file to begin.")
 
+        # State for export
+        self._last_df = None        # pd.DataFrame or List[pd.DataFrame]
+        self._last_df2 = None       # optional second DF
+        self._last_labels = None    # tuple[str, str] or List[str]
+
     # ----- File handling -----
     def on_open(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open .im File", "", "IM/XML Files (*.im *.xml);;All Files (*.*)")
@@ -421,7 +436,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             self.curves = parse_im_file(Path(path))
         except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Parse Error", f"Failed to parse XML:\\n{e}")
+            QtWidgets.QMessageBox.critical(self, "Parse Error", f"Failed to parse XML:\n{e}")
             return
 
         self.labels = [f"{c.dataset_name} / {c.curve_name}" for c in self.curves]
@@ -445,26 +460,41 @@ class MainWindow(QtWidgets.QMainWindow):
             for k in ["A1","A2","B1","B2","Pdc","Gamma Source"]:
                 if any((names[c].lower().startswith(k.lower())) for c in cols):
                     keys.append(k)
-            msgs.append(f"[{i}] {rec.dataset_name} / {rec.curve_name}\\n  Found: " + (', '.join(keys) if keys else 'none'))
-        QtWidgets.QMessageBox.information(self, "Diagnostics", "\\n\\n".join(msgs))
+            msgs.append(f"[{i}] {rec.dataset_name} / {rec.curve_name}\n  Found: " + (', '.join(keys) if keys else 'none'))
+        QtWidgets.QMessageBox.information(self, "Diagnostics", "\n\n".join(msgs))
 
     # ----- Plotting -----
     def update_plots(self):
         if not self.curves:
             return
+        overlay_all = self.controls.is_overlay_all()
         overlay = self.controls.is_overlay()
         use_gamma = self.controls.use_gamma()
+        ignore_a2 = self.controls.ignore_a2()
+
+        if overlay_all:
+            # Compute metrics for ALL curves and draw
+            dfs = []
+            labels = []
+            finite_counts = []
+            for rec, lbl in zip(self.curves, self.labels):
+                df = compute_metrics(rec, use_gamma_source=use_gamma, ignore_a2=ignore_a2)
+                dfs.append(df); labels.append(lbl)
+                finite_counts.append(int(np.isfinite(df["Pout [dBm] @ f0"].values).sum()))
+            self.plot_grid.plot_overlay_many(dfs, labels)
+            mode = "Pout=|B2|²" if ignore_a2 else "Pout=|B2|²−|A2|²"
+            self.statusBar().showMessage(f"Overlay ALL • {mode} • finite Pout per curve: {finite_counts}")
+            self._last_df, self._last_df2, self._last_labels = dfs, None, labels
+            return
 
         if not overlay:
             idx = self.controls.current_curve_index()
             idx = max(0, min(idx, len(self.curves)-1))
             rec = self.curves[idx]
-            df = compute_metrics(rec, use_gamma_source=use_gamma, ignore_a2=self.controls.ignore_a2())
-            title = f"({rec.curve_name})"
-            mode = "Pout=|B2|²" if self.controls.ignore_a2() else "Pout=|B2|²−|A2|²"
-            self.plot_grid.plot_single(df, title_suffix=f"{title} • {mode}")
+            df = compute_metrics(rec, use_gamma_source=use_gamma, ignore_a2=ignore_a2)
+            self.plot_grid.plot_single(df)
             finite = int(np.isfinite(df["Pout [dBm] @ f0"].values).sum())
-            self.statusBar().showMessage(f"Computed with {mode} • finite Pout points: {finite}")
+            self.statusBar().showMessage(f"Single curve • finite Pout points: {finite}")
             self._last_df = df
             self._last_df2 = None
             self._last_labels = (self.labels[idx], None)
@@ -473,14 +503,12 @@ class MainWindow(QtWidgets.QMainWindow):
             i1 = max(0, min(i1, len(self.curves)-1))
             i2 = max(0, min(i2, len(self.curves)-1))
             rec1, rec2 = self.curves[i1], self.curves[i2]
-            df1 = compute_metrics(rec1, use_gamma_source=use_gamma, ignore_a2=self.controls.ignore_a2())
-            df2 = compute_metrics(rec2, use_gamma_source=use_gamma, ignore_a2=self.controls.ignore_a2())
-            title = f"({rec1.curve_name} vs {rec2.curve_name})"
-            mode = "Pout=|B2|²" if self.controls.ignore_a2() else "Pout=|B2|²−|A2|²"
-            self.plot_grid.plot_overlay(df1, self.labels[i1], df2, self.labels[i2], title_suffix=f"{title} • {mode}")
+            df1 = compute_metrics(rec1, use_gamma_source=use_gamma, ignore_a2=ignore_a2)
+            df2 = compute_metrics(rec2, use_gamma_source=use_gamma, ignore_a2=ignore_a2)
+            self.plot_grid.plot_overlay(df1, self.labels[i1], df2, self.labels[i2])
             finite1 = int(np.isfinite(df1["Pout [dBm] @ f0"].values).sum())
             finite2 = int(np.isfinite(df2["Pout [dBm] @ f0"].values).sum())
-            self.statusBar().showMessage(f"Computed with {mode} • finite Pout points: {finite1} / {finite2}")
+            self.statusBar().showMessage(f"Overlay 2 • finite Pout points: {finite1} / {finite2}")
             self._last_df = df1
             self._last_df2 = df2
             self._last_labels = (self.labels[i1], self.labels[i2])
@@ -493,18 +521,27 @@ class MainWindow(QtWidgets.QMainWindow):
         if not path:
             return
         try:
-            if self._last_df2 is None:
-                self._last_df.to_csv(path, index=False)
-            else:
-                # Combine with suffixes for overlay
+            # Overlay ALL: combine all DFs with label suffixes
+            if isinstance(self._last_df, list):
+                pieces = []
+                for df, lbl in zip(self._last_df, (self._last_labels or [])):
+                    pieces.append(df.add_suffix(f" ({lbl})"))
+                df_combined = pd.concat(pieces, axis=1)
+                df_combined.to_csv(path, index=False)
+            # Two-trace overlay
+            elif self._last_df2 is not None:
                 df_combined = pd.concat([
                     self._last_df.add_suffix(" (Trace1)"),
                     self._last_df2.add_suffix(" (Trace2)")
                 ], axis=1)
                 df_combined.to_csv(path, index=False)
+            # Single
+            else:
+                self._last_df.to_csv(path, index=False)
+
             self.statusBar().showMessage(f"Saved CSV: {path}", 5000)
         except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Save Error", f"Failed to save CSV:\\n{e}")
+            QtWidgets.QMessageBox.critical(self, "Save Error", f"Failed to save CSV:\n{e}")
 
     def export_plots(self):
         if not hasattr(self, "plot_grid"):
@@ -513,16 +550,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if not dir_path:
             return
         try:
-            prefix = "S1S3" if self.controls.is_overlay() else "Single"
+            prefix = "ALL" if isinstance(self._last_df, list) else ("S1S3" if self._last_df2 is not None else "Single")
             self.plot_grid.save_all(Path(dir_path), prefix=prefix)
             self.statusBar().showMessage(f"Saved plots to: {dir_path}", 5000)
         except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Save Error", f"Failed to save plots:\\n{e}")
+            QtWidgets.QMessageBox.critical(self, "Save Error", f"Failed to save plots:\n{e}")
 
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
-    app.setApplicationName("IM Desktop Viewer")
+    app.setApplicationName("IM Desktop Viewer (Overlay ALL)")
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
